@@ -1,0 +1,39 @@
+ARG BASE_IMAGE=docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.0
+FROM ${BASE_IMAGE}
+
+ARG OLD_NETTY_VERSION=4.1.132.Final
+ARG NEW_NETTY_VERSION=4.1.133.Final
+
+USER 0
+
+COPY netty-patch/jars/*.jar /tmp/netty-patch/
+
+RUN set -eu; \
+    replaced=0; \
+    for old_jar in $(find /usr/share/elasticsearch/modules -type f -name "netty-*-${OLD_NETTY_VERSION}.jar" | sort); do \
+      file_name="${old_jar##*/}"; \
+      artifact_id="${file_name%-${OLD_NETTY_VERSION}.jar}"; \
+      replacement="/tmp/netty-patch/${artifact_id}-${NEW_NETTY_VERSION}.jar"; \
+      if [ ! -f "${replacement}" ]; then \
+        echo "Missing replacement for ${old_jar}: ${replacement}" >&2; \
+        exit 1; \
+      fi; \
+      module_dir="${old_jar%/*}"; \
+      rm "${old_jar}"; \
+      cp "${replacement}" "${module_dir}/${artifact_id}-${NEW_NETTY_VERSION}.jar"; \
+      chown 0:0 "${module_dir}/${artifact_id}-${NEW_NETTY_VERSION}.jar"; \
+      chmod 0444 "${module_dir}/${artifact_id}-${NEW_NETTY_VERSION}.jar"; \
+      replaced=$((replaced + 1)); \
+    done; \
+    if [ "${replaced}" -eq 0 ]; then \
+      echo "No Netty ${OLD_NETTY_VERSION} jars were found to replace" >&2; \
+      exit 1; \
+    fi; \
+    stale_jar="$(find /usr/share/elasticsearch/modules -type f -name "netty-*-${OLD_NETTY_VERSION}.jar" -print -quit)"; \
+    if [ -n "${stale_jar}" ]; then \
+      echo "Stale Netty jar remains: ${stale_jar}" >&2; \
+      exit 1; \
+    fi; \
+    rm -rf /tmp/netty-patch
+
+USER 1000:0
