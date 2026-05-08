@@ -1,12 +1,22 @@
 ARG BASE_IMAGE=docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.0
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS patched
 
 ARG OLD_NETTY_VERSION=4.1.132.Final
 ARG NEW_NETTY_VERSION=4.1.133.Final
+ARG GLIBC_VERSION=2.43-r7
+ARG LOG4J_VERSION=2.25.4
+ARG APM_AGENT_VERSION=1.55.6
 
 USER 0
 
 COPY netty-patch/jars/*.jar /tmp/netty-patch/
+COPY log4j-patch/jars/*.jar /tmp/log4j-patch/
+
+RUN apk add --no-cache --upgrade \
+      glibc=${GLIBC_VERSION} \
+      glibc-locale-posix=${GLIBC_VERSION} \
+      ld-linux=${GLIBC_VERSION} \
+      libcrypt1=${GLIBC_VERSION}
 
 RUN set -eu; \
     replaced=0; \
@@ -36,4 +46,82 @@ RUN set -eu; \
     fi; \
     rm -rf /tmp/netty-patch
 
+RUN set -eu; \
+    for artifact_id in log4j-api log4j-1.2-api log4j-slf4j2-impl; do \
+      replacement="/tmp/log4j-patch/${artifact_id}-${LOG4J_VERSION}.jar"; \
+      if [ ! -f "${replacement}" ]; then \
+        echo "Missing Log4j replacement: ${replacement}" >&2; \
+        exit 1; \
+      fi; \
+      for old_jar in $(find /usr/share/elasticsearch -type f -name "${artifact_id}-*.jar" ! -name "${artifact_id}-${LOG4J_VERSION}.jar" | sort); do \
+        module_dir="${old_jar%/*}"; \
+        rm "${old_jar}"; \
+        cp "${replacement}" "${module_dir}/${artifact_id}-${LOG4J_VERSION}.jar"; \
+        chown 0:0 "${module_dir}/${artifact_id}-${LOG4J_VERSION}.jar"; \
+        chmod 0444 "${module_dir}/${artifact_id}-${LOG4J_VERSION}.jar"; \
+      done; \
+    done; \
+    cp "/tmp/log4j-patch/log4j-core-${LOG4J_VERSION}.jar" /usr/share/elasticsearch/lib/elasticsearch-log4j-9.4.0.jar; \
+    chown 0:0 /usr/share/elasticsearch/lib/elasticsearch-log4j-9.4.0.jar; \
+    chmod 0444 /usr/share/elasticsearch/lib/elasticsearch-log4j-9.4.0.jar; \
+    old_apm_agent="$(find /usr/share/elasticsearch/modules/apm -maxdepth 1 -type f -name 'elastic-apm-agent-java8-*.jar' -print -quit)"; \
+    if [ -z "${old_apm_agent}" ]; then \
+      echo "Missing elastic APM agent jar" >&2; \
+      exit 1; \
+    fi; \
+    rm "${old_apm_agent}"; \
+    cp "/tmp/log4j-patch/elastic-apm-agent-java8-${APM_AGENT_VERSION}.jar" "/usr/share/elasticsearch/modules/apm/elastic-apm-agent-java8-${APM_AGENT_VERSION}.jar"; \
+    chown 0:0 "/usr/share/elasticsearch/modules/apm/elastic-apm-agent-java8-${APM_AGENT_VERSION}.jar"; \
+    chmod 0444 "/usr/share/elasticsearch/modules/apm/elastic-apm-agent-java8-${APM_AGENT_VERSION}.jar"; \
+    stale_log4j="$(find /usr/share/elasticsearch -type f \( -name 'log4j-api-2.19.0.jar' -o -name 'log4j-1.2-api-2.19.0.jar' -o -name 'log4j-slf4j2-impl-2.19.0.jar' -o -name 'elastic-apm-agent-java8-1.55.0.jar' \) -print -quit)"; \
+    if [ -n "${stale_log4j}" ]; then \
+      echo "Stale Log4j/APM jar remains: ${stale_log4j}" >&2; \
+      exit 1; \
+    fi; \
+    rm -rf /tmp/log4j-patch
+
+FROM scratch
+
+COPY --from=patched / /
+
 USER 1000:0
+
+ENV PATH=/usr/share/elasticsearch/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV ELASTIC_CONTAINER=true
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=0
+ENV SHELL=/bin/bash
+
+WORKDIR /usr/share/elasticsearch
+
+EXPOSE 9200 9300
+
+LABEL org.label-schema.build-date="2026-04-30T15:05:34.751113474Z" \
+      org.label-schema.license="Elastic-License-2.0" \
+      org.label-schema.name="Elasticsearch" \
+      org.label-schema.schema-version="1.0" \
+      org.label-schema.url="https://www.elastic.co/products/elasticsearch" \
+      org.label-schema.usage="https://www.elastic.co/guide/en/elasticsearch/reference/index.html" \
+      org.label-schema.vcs-ref="2e8528e92361c3399724226deaf2b46f933e925b" \
+      org.label-schema.vcs-url="https://github.com/elastic/elasticsearch" \
+      org.label-schema.vendor="Elastic" \
+      org.label-schema.version="9.4.0" \
+      org.opencontainers.image.created="2026-04-30T15:05:34.751113474Z" \
+      org.opencontainers.image.documentation="https://www.elastic.co/guide/en/elasticsearch/reference/index.html" \
+      org.opencontainers.image.licenses="Elastic-License-2.0" \
+      org.opencontainers.image.revision="2e8528e92361c3399724226deaf2b46f933e925b" \
+      org.opencontainers.image.source="https://github.com/elastic/elasticsearch" \
+      org.opencontainers.image.title="Elasticsearch" \
+      org.opencontainers.image.url="https://www.elastic.co/products/elasticsearch" \
+      org.opencontainers.image.vendor="Elastic" \
+      org.opencontainers.image.version="9.4.0" \
+      name="Elasticsearch" \
+      maintainer="infra@elastic.co" \
+      vendor="Elastic" \
+      version="9.4.0" \
+      release="1" \
+      summary="Elasticsearch" \
+      description="You know, for search."
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+CMD ["eswrapper"]

@@ -1,0 +1,5 @@
+org.apache.logging.log4j log4j-api 2.25.4
+org.apache.logging.log4j log4j-core 2.25.4
+org.apache.logging.log4j log4j-1.2-api 2.25.4
+org.apache.logging.log4j log4j-slf4j2-impl 2.25.4
+co.elastic.apm elastic-apm-agent-java8 1.55.6
