@@ -1,0 +1,119 @@
+ARG BASE_IMAGE=docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.3
+FROM maven:3.9-eclipse-temurin-21 AS parquet-jackson-patch
+
+ARG PARQUET_HADOOP_BUNDLE_VERSION=1.17.1
+ARG PARQUET_SHADED_JACKSON_VERSION=2.21.4
+ARG JACKSON_ANNOTATIONS_VERSION=2.21
+ARG MAVEN_BASE_URL=https://repo1.maven.org/maven2
+
+COPY patches/parquet-jackson-shade-pom.xml /tmp/parquet-jackson-patch/pom.xml
+
+RUN set -eu; \
+    workdir="/tmp/parquet-jackson-patch"; \
+    cd "${workdir}"; \
+    jar_name="parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar"; \
+    artifact_url="${MAVEN_BASE_URL}/org/apache/parquet/parquet-hadoop-bundle/${PARQUET_HADOOP_BUNDLE_VERSION}/${jar_name}"; \
+    curl -fsSL --retry 3 --retry-delay 2 -o "${jar_name}" "${artifact_url}"; \
+    expected_sha1="$(curl -fsSL "${artifact_url}.sha1" | tr -d '[:space:]')"; \
+    actual_sha1="$(sha1sum "${jar_name}" | awk '{print $1}')"; \
+    if [ "${expected_sha1}" != "${actual_sha1}" ]; then \
+      echo "Checksum mismatch for ${jar_name}" >&2; \
+      echo "expected: ${expected_sha1}" >&2; \
+      echo "actual:   ${actual_sha1}" >&2; \
+      exit 1; \
+    fi; \
+    mvn -q \
+      -Djackson.version="${PARQUET_SHADED_JACKSON_VERSION}" \
+      -Djackson.annotations.version="${JACKSON_ANNOTATIONS_VERSION}" \
+      -DskipTests \
+      package; \
+    mkdir original relocated out; \
+    (cd original && jar xf "../${jar_name}"); \
+    (cd relocated && jar xf "../target/parquet-jackson-relocator-1.0.0-relocated.jar"); \
+    rm -rf original/shaded/parquet/com/fasterxml/jackson; \
+    rm -rf original/META-INF/maven/com.fasterxml.jackson.core; \
+    cp -R relocated/shaded original/; \
+    if [ -d relocated/META-INF/maven/com.fasterxml.jackson.core ]; then \
+      mkdir -p original/META-INF/maven; \
+      cp -R relocated/META-INF/maven/com.fasterxml.jackson.core original/META-INF/maven/; \
+    fi; \
+    (cd original && jar cfm "../out/${jar_name}" META-INF/MANIFEST.MF .); \
+    jar tf "out/${jar_name}" | grep -q 'shaded/parquet/com/fasterxml/jackson/databind/ObjectMapper.class'
+
+FROM ${BASE_IMAGE}
+
+ARG JACKSON_DATABIND_VERSION=2.18.8
+ARG PARQUET_HADOOP_BUNDLE_VERSION=1.17.1
+ARG MAVEN_BASE_URL=https://repo1.maven.org/maven2
+
+USER 0
+
+COPY --from=parquet-jackson-patch /tmp/parquet-jackson-patch/out/parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar /tmp/parquet-hadoop-bundle-patched.jar
+
+RUN set -eu; \
+    apk update; \
+    packages=""; \
+    for pkg in busybox libcrypto3 libssl3 libcurl-openssl4 openssl; do \
+      if apk info -e "${pkg}" >/dev/null 2>&1; then \
+        packages="${packages} ${pkg}"; \
+      fi; \
+    done; \
+    if [ -n "${packages}" ]; then \
+      apk upgrade --no-cache ${packages}; \
+    fi; \
+    rm -rf /var/cache/apk/*
+
+RUN set -eu; \
+    workdir="$(mktemp -d)"; \
+    download_jar() { \
+      group_path="$1"; \
+      artifact="$2"; \
+      version="$3"; \
+      jar_name="${artifact}-${version}.jar"; \
+      artifact_url="${MAVEN_BASE_URL}/${group_path}/${artifact}/${version}/${jar_name}"; \
+      target="${workdir}/${jar_name}"; \
+      curl -fsSL --retry 3 --retry-delay 2 -o "${target}" "${artifact_url}"; \
+      expected_sha1="$(curl -fsSL "${artifact_url}.sha1" | tr -d '[:space:]')"; \
+      actual_sha1="$(sha1sum "${target}" | awk '{print $1}')"; \
+      if [ "${expected_sha1}" != "${actual_sha1}" ]; then \
+        echo "Checksum mismatch for ${jar_name}" >&2; \
+        echo "expected: ${expected_sha1}" >&2; \
+        echo "actual:   ${actual_sha1}" >&2; \
+        exit 1; \
+      fi; \
+    }; \
+    download_jar com/fasterxml/jackson/core jackson-databind "${JACKSON_DATABIND_VERSION}"; \
+    jackson_replaced=0; \
+    for old_jar in $(find /usr/share/elasticsearch -type f -name 'jackson-databind-*.jar' | sort); do \
+      module_dir="${old_jar%/*}"; \
+      rm "${old_jar}"; \
+      cp "${workdir}/jackson-databind-${JACKSON_DATABIND_VERSION}.jar" "${module_dir}/jackson-databind-${JACKSON_DATABIND_VERSION}.jar"; \
+      chown 0:0 "${module_dir}/jackson-databind-${JACKSON_DATABIND_VERSION}.jar"; \
+      chmod 0444 "${module_dir}/jackson-databind-${JACKSON_DATABIND_VERSION}.jar"; \
+      jackson_replaced=$((jackson_replaced + 1)); \
+    done; \
+    if [ "${jackson_replaced}" -eq 0 ]; then \
+      echo "No jackson-databind JARs were found to replace" >&2; \
+      exit 1; \
+    fi; \
+    parquet_replaced=0; \
+    for old_jar in $(find /usr/share/elasticsearch/modules -type f -name 'parquet-hadoop-bundle-*.jar' | sort); do \
+      module_dir="${old_jar%/*}"; \
+      rm "${old_jar}"; \
+      cp "/tmp/parquet-hadoop-bundle-patched.jar" "${module_dir}/parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar"; \
+      chown 0:0 "${module_dir}/parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar"; \
+      chmod 0444 "${module_dir}/parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar"; \
+      parquet_replaced=$((parquet_replaced + 1)); \
+    done; \
+    if [ "${parquet_replaced}" -eq 0 ]; then \
+      echo "No parquet-hadoop-bundle JARs were found to replace" >&2; \
+      exit 1; \
+    fi; \
+    stale="$(find /usr/share/elasticsearch -type f \( -name 'jackson-databind-2.15.0.jar' -o -name 'parquet-hadoop-bundle-1.17.0.jar' \) -print -quit)"; \
+    if [ -n "${stale}" ]; then \
+      echo "Stale vulnerable JAR remains: ${stale}" >&2; \
+      exit 1; \
+    fi; \
+    rm -rf "${workdir}" /tmp/parquet-hadoop-bundle-patched.jar
+
+USER 1000:0
