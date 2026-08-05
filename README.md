@@ -1,169 +1,106 @@
 Elasticsearch Docker image hardening
 ====================================
 
-This repository builds hardened Elasticsearch images from official Elastic
-images.
+This repository builds a hardened Elasticsearch image from the official
+Elastic Wolfi image.
 
-Current security-gate image
----------------------------
+Current release
+---------------
 
-- Final tag: `jahrkor/elasticsearch-docker:9.4.3-wolfi-no-high-20260703`
-- Dockerfile: `Dockerfile.jackson-patched`
-- Base image: `docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.3`
-- Elasticsearch: `9.4.3`
-- OS family: Wolfi/Chainguard, using `apk`
+- Release tag: `hrafnox/elasticrune:2.2.0`
+- Build Dockerfile: `Dockerfile.jackson-patched`
+- Base image: `docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.4`
+- Elasticsearch: `9.4.4`
+- Platform: `linux/amd64`
 - Runtime user: `1000:0`
-- Entrypoint/CMD: inherited from the official image
-- Exposed ports: inherited from the official image, `9200` and `9300`
+- Entrypoint and exposed ports: inherited from the official image
+- Azure snapshot repositories: bundled `repository-azure` module
 
-The strict security gate for this repository is:
-
-- `0` Critical vulnerabilities
-- `0` High vulnerabilities
-- No Trivy suppression, allowlist, or `.trivyignore`
-
-See `SECURITY_VALIDATION.md` for the full validation evidence, official image
-scan matrix, compatibility notes, and rollout instructions.
+The release security gate is zero Critical and zero High vulnerabilities,
+without Trivy ignores, severity changes, grace periods, or unfixed-finding
+suppression.
 
 Vulnerability remediation
 -------------------------
 
-The original image findings were:
+Elasticsearch `9.4.4` supplies fixed direct Jackson `2.18.8` artifacts. Two
+Parquet bundles still contained vulnerable shaded Jackson classes, and the
+distribution still supplied Netty `4.1.135.Final`.
 
-- OpenSSL scanner findings against `3.6.2-r2`
-- BusyBox `CVE-2023-39810` against `1.37.0-r57`
-- Netty findings against `4.1.133.Final`
+`Dockerfile.jackson-patched` therefore makes two narrowly scoped distribution
+patches:
 
-The official Elasticsearch `9.4.3` Wolfi image remediated those original
-findings by moving to newer Wolfi packages and Netty `4.1.135.Final`, but it
-still reported upstream Jackson HIGH findings:
+- replaces both `parquet-hadoop-bundle-1.17.0.jar` copies with a repacked
+  `1.17.1` bundle whose shaded Jackson components are `2.21.4`;
+- replaces every Netty `4.1.135.Final` module with the corresponding
+  `4.1.136.Final` artifact as one aligned set.
 
-- `CVE-2026-54512`
-- `CVE-2026-54513`
-
-No official Elastic image tested passed the `0 Critical / 0 High` gate. The
-final gate-passing image therefore uses `Dockerfile.jackson-patched`, based on
-`docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.3`, and makes the
-minimum Jackson-related internal JAR replacements needed to clear the gate.
-
-Manual JAR replacements in `Dockerfile.jackson-patched`:
-
-- `jackson-databind-2.15.0.jar` to `jackson-databind-2.18.8.jar`
-- `parquet-hadoop-bundle-1.17.0.jar` to a patched
-  `parquet-hadoop-bundle-1.17.1.jar`
-- Shaded Jackson classes inside the Parquet bundle rebuilt to Jackson `2.21.4`
-  with `jackson-annotations` `2.21`
-
-The default `Dockerfile` remains the official-image hardening path without
-manual Jackson replacement. Use `Dockerfile.jackson-patched` for the strict
-security-gate image.
+Downloaded artifacts are checked against their Maven Central SHA-1 files.
+The image build fails if an expected replacement is missing, if no matching
+distribution JAR is found, or if a stale vulnerable-version JAR remains.
 
 Build
 -----
 
+The default build is a fresh `linux/amd64` build of the release tag and pulls
+the current base-image manifest:
+
 ```sh
-DOCKERFILE=Dockerfile.jackson-patched \
-IMAGE_NAME=jahrkor/elasticsearch-docker \
-TAG=9.4.3-wolfi-no-high-20260703 \
 ./scripts/build-elasticsearch-image.sh
 ```
 
-Equivalent direct command:
-
-```sh
-docker build -f Dockerfile.jackson-patched \
-  -t jahrkor/elasticsearch-docker:9.4.3-wolfi-no-high-20260703 \
-  .
-```
+Set `NO_CACHE=false` only for local development. The image name, tag,
+Dockerfile, context, and platform remain overrideable through `IMAGE_NAME`,
+`TAG`, `DOCKERFILE`, `CONTEXT`, and `PLATFORM`.
 
 Scan
 ----
 
+Trivy is required. The script scans Critical and High findings, includes
+unfixed findings, and exits nonzero if any finding is detected:
+
 ```sh
-TRIVY_EXIT_CODE=1 \
-IMAGE_NAME=jahrkor/elasticsearch-docker \
-TAG=9.4.3-wolfi-no-high-20260703 \
 ./scripts/scan-elasticsearch-image.sh
 ```
 
-Equivalent direct command:
-
-```sh
-trivy image \
-  --severity CRITICAL,HIGH \
-  --exit-code 1 \
-  --ignore-unfixed=false \
-  jahrkor/elasticsearch-docker:9.4.3-wolfi-no-high-20260703
-```
-
-Expected result: Trivy exits `0` with `0 CRITICAL` and `0 HIGH`.
+Expected result for the release image: `0 CRITICAL`, `0 HIGH`.
 
 Smoke test
 ----------
 
 ```sh
-docker run --rm --name elasticsearch-no-high-test \
+docker run --rm --name elasticrune-smoke \
   -p 9200:9200 \
-  -e "discovery.type=single-node" \
-  -e "xpack.security.enabled=false" \
-  jahrkor/elasticsearch-docker:9.4.3-wolfi-no-high-20260703
+  -e 'discovery.type=single-node' \
+  -e 'xpack.security.enabled=false' \
+  -e 'ES_JAVA_OPTS=-Xms512m -Xmx512m' \
+  hrafnox/elasticrune:2.2.0
 ```
 
-In another shell:
+Verify the root endpoint, cluster health, and installed plugins:
 
 ```sh
-curl http://localhost:9200
+curl http://localhost:9200/
 curl http://localhost:9200/_cluster/health
+curl 'http://localhost:9200/_cat/plugins?format=json'
 ```
-
-Expected result: the root endpoint returns Elasticsearch `9.4.3`, and the
-cluster health endpoint returns `status: green`.
-
-Push to DockerHub
------------------
-
-Do not tag or push `latest` for this release.
-
-```sh
-docker login
-docker push jahrkor/elasticsearch-docker:9.4.3-wolfi-no-high-20260703
-```
-
-Build-and-push equivalent for a fresh linux/amd64 build:
-
-```sh
-docker buildx build --platform linux/amd64 \
-  -f Dockerfile.jackson-patched \
-  -t jahrkor/elasticsearch-docker:9.4.3-wolfi-no-high-20260703 \
-  --push .
-```
-
-Rollback
---------
-
-For deployment rollback:
-
-1. Restore the previous Elasticsearch image tag in the deployment config.
-2. Redeploy the workload.
-3. Verify the root and cluster health endpoints:
-
-```sh
-curl http://localhost:9200
-curl http://localhost:9200/_cluster/health
-```
-
-The root endpoint should respond, and `/_cluster/health` should return an
-acceptable status for the environment.
 
 Compatibility note
 ------------------
 
-The final image manually replaces internal Elasticsearch Jackson-related JARs
-because no official Elasticsearch image passed the strict gate. The container
-starts, the root API responds, cluster health is green, and Trivy reports
-`0 CRITICAL` and `0 HIGH`.
+Netty and the shaded Parquet/Jackson implementation are internal
+Elasticsearch distribution dependencies. Startup, green cluster health,
+authentication, plugin enumeration, and index/document CRUD are validated for
+this release. Workloads using Azure, gRPC, inference, or ESQL external data
+sources should retain targeted integration coverage because those modules also
+consume the aligned Netty replacement set.
 
-Before production rollout, run workload-specific tests for any used modules
-that depend on the replaced JARs, especially GeoIP, Azure repository or Azure
-ESQL data sources, Enterprise Search, inference, and ESQL Parquet/Iceberg data
-source workflows.
+Azure snapshot repositories
+---------------------------
+
+Elasticsearch `9.4.4` bundles the version-matched `repository-azure` module,
+so this image does not install a duplicate plugin or add Azure SDK JARs. See
+`AZURE_REPOSITORY.md` for secure deployment-time credential configuration,
+repository registration, verification, snapshot, and identity examples.
+
+Do not push `latest` or any rolling tag for this release.

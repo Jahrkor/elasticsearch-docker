@@ -1,9 +1,10 @@
-ARG BASE_IMAGE=docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.3
+ARG BASE_IMAGE=docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.4
 FROM maven:3.9-eclipse-temurin-21 AS parquet-jackson-patch
 
 ARG PARQUET_HADOOP_BUNDLE_VERSION=1.17.1
 ARG PARQUET_SHADED_JACKSON_VERSION=2.21.4
 ARG JACKSON_ANNOTATIONS_VERSION=2.21
+ARG NETTY_VERSION=4.1.136.Final
 ARG MAVEN_BASE_URL=https://repo1.maven.org/maven2
 
 COPY patches/parquet-jackson-shade-pom.xml /tmp/parquet-jackson-patch/pom.xml
@@ -38,17 +39,51 @@ RUN set -eu; \
       cp -R relocated/META-INF/maven/com.fasterxml.jackson.core original/META-INF/maven/; \
     fi; \
     (cd original && jar cfm "../out/${jar_name}" META-INF/MANIFEST.MF .); \
-    jar tf "out/${jar_name}" | grep -q 'shaded/parquet/com/fasterxml/jackson/databind/ObjectMapper.class'
+    jar tf "out/${jar_name}" | grep -q 'shaded/parquet/com/fasterxml/jackson/databind/ObjectMapper.class'; \
+    mkdir -p /tmp/netty-patch; \
+    for artifact in \
+      netty-buffer \
+      netty-codec \
+      netty-codec-dns \
+      netty-codec-http \
+      netty-codec-http2 \
+      netty-codec-socks \
+      netty-common \
+      netty-handler \
+      netty-handler-proxy \
+      netty-resolver \
+      netty-resolver-dns \
+      netty-transport \
+      netty-transport-classes-epoll \
+      netty-transport-native-unix-common; do \
+        netty_jar="${artifact}-${NETTY_VERSION}.jar"; \
+        netty_url="${MAVEN_BASE_URL}/io/netty/${artifact}/${NETTY_VERSION}/${netty_jar}"; \
+        curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/netty-patch/${netty_jar}" "${netty_url}"; \
+        expected_sha1="$(curl -fsSL "${netty_url}.sha1" | tr -d '[:space:]')"; \
+        actual_sha1="$(sha1sum "/tmp/netty-patch/${netty_jar}" | awk '{print $1}')"; \
+        if [ "${expected_sha1}" != "${actual_sha1}" ]; then \
+          echo "Checksum mismatch for ${netty_jar}" >&2; \
+          echo "expected: ${expected_sha1}" >&2; \
+          echo "actual:   ${actual_sha1}" >&2; \
+          exit 1; \
+        fi; \
+    done
 
 FROM ${BASE_IMAGE}
 
-ARG JACKSON_DATABIND_VERSION=2.18.8
+ARG RELEASE_VERSION
 ARG PARQUET_HADOOP_BUNDLE_VERSION=1.17.1
-ARG MAVEN_BASE_URL=https://repo1.maven.org/maven2
+ARG OLD_NETTY_VERSION=4.1.135.Final
+ARG NETTY_VERSION=4.1.136.Final
+
+LABEL org.opencontainers.image.title="Elasticrune" \
+      org.opencontainers.image.version="${RELEASE_VERSION}" \
+      org.opencontainers.image.description="Elasticsearch image with security remediations and Azure snapshot repository support"
 
 USER 0
 
 COPY --from=parquet-jackson-patch /tmp/parquet-jackson-patch/out/parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar /tmp/parquet-hadoop-bundle-patched.jar
+COPY --from=parquet-jackson-patch /tmp/netty-patch/ /tmp/netty-patch/
 
 RUN set -eu; \
     apk update; \
@@ -64,38 +99,6 @@ RUN set -eu; \
     rm -rf /var/cache/apk/*
 
 RUN set -eu; \
-    workdir="$(mktemp -d)"; \
-    download_jar() { \
-      group_path="$1"; \
-      artifact="$2"; \
-      version="$3"; \
-      jar_name="${artifact}-${version}.jar"; \
-      artifact_url="${MAVEN_BASE_URL}/${group_path}/${artifact}/${version}/${jar_name}"; \
-      target="${workdir}/${jar_name}"; \
-      curl -fsSL --retry 3 --retry-delay 2 -o "${target}" "${artifact_url}"; \
-      expected_sha1="$(curl -fsSL "${artifact_url}.sha1" | tr -d '[:space:]')"; \
-      actual_sha1="$(sha1sum "${target}" | awk '{print $1}')"; \
-      if [ "${expected_sha1}" != "${actual_sha1}" ]; then \
-        echo "Checksum mismatch for ${jar_name}" >&2; \
-        echo "expected: ${expected_sha1}" >&2; \
-        echo "actual:   ${actual_sha1}" >&2; \
-        exit 1; \
-      fi; \
-    }; \
-    download_jar com/fasterxml/jackson/core jackson-databind "${JACKSON_DATABIND_VERSION}"; \
-    jackson_replaced=0; \
-    for old_jar in $(find /usr/share/elasticsearch -type f -name 'jackson-databind-*.jar' | sort); do \
-      module_dir="${old_jar%/*}"; \
-      rm "${old_jar}"; \
-      cp "${workdir}/jackson-databind-${JACKSON_DATABIND_VERSION}.jar" "${module_dir}/jackson-databind-${JACKSON_DATABIND_VERSION}.jar"; \
-      chown 0:0 "${module_dir}/jackson-databind-${JACKSON_DATABIND_VERSION}.jar"; \
-      chmod 0444 "${module_dir}/jackson-databind-${JACKSON_DATABIND_VERSION}.jar"; \
-      jackson_replaced=$((jackson_replaced + 1)); \
-    done; \
-    if [ "${jackson_replaced}" -eq 0 ]; then \
-      echo "No jackson-databind JARs were found to replace" >&2; \
-      exit 1; \
-    fi; \
     parquet_replaced=0; \
     for old_jar in $(find /usr/share/elasticsearch/modules -type f -name 'parquet-hadoop-bundle-*.jar' | sort); do \
       module_dir="${old_jar%/*}"; \
@@ -109,11 +112,36 @@ RUN set -eu; \
       echo "No parquet-hadoop-bundle JARs were found to replace" >&2; \
       exit 1; \
     fi; \
-    stale="$(find /usr/share/elasticsearch -type f \( -name 'jackson-databind-2.15.0.jar' -o -name 'parquet-hadoop-bundle-1.17.0.jar' \) -print -quit)"; \
+    stale="$(find /usr/share/elasticsearch -type f \( -name 'jackson-core-2.15.0.jar' -o -name 'jackson-databind-2.15.0.jar' -o -name 'parquet-hadoop-bundle-1.17.0.jar' \) -print -quit)"; \
     if [ -n "${stale}" ]; then \
       echo "Stale vulnerable JAR remains: ${stale}" >&2; \
       exit 1; \
     fi; \
-    rm -rf "${workdir}" /tmp/parquet-hadoop-bundle-patched.jar
+    netty_replaced=0; \
+    for old_jar in $(find /usr/share/elasticsearch/modules -type f -name "netty-*-${OLD_NETTY_VERSION}.jar" | sort); do \
+      file_name="${old_jar##*/}"; \
+      artifact="${file_name%-${OLD_NETTY_VERSION}.jar}"; \
+      replacement="/tmp/netty-patch/${artifact}-${NETTY_VERSION}.jar"; \
+      if [ ! -f "${replacement}" ]; then \
+        echo "Missing aligned Netty replacement for ${old_jar}: ${replacement}" >&2; \
+        exit 1; \
+      fi; \
+      module_dir="${old_jar%/*}"; \
+      rm "${old_jar}"; \
+      cp "${replacement}" "${module_dir}/${artifact}-${NETTY_VERSION}.jar"; \
+      chown 0:0 "${module_dir}/${artifact}-${NETTY_VERSION}.jar"; \
+      chmod 0444 "${module_dir}/${artifact}-${NETTY_VERSION}.jar"; \
+      netty_replaced=$((netty_replaced + 1)); \
+    done; \
+    if [ "${netty_replaced}" -eq 0 ]; then \
+      echo "No Netty ${OLD_NETTY_VERSION} JARs were found to replace" >&2; \
+      exit 1; \
+    fi; \
+    stale_netty="$(find /usr/share/elasticsearch/modules -type f -name "netty-*-${OLD_NETTY_VERSION}.jar" -print -quit)"; \
+    if [ -n "${stale_netty}" ]; then \
+      echo "Stale vulnerable Netty JAR remains: ${stale_netty}" >&2; \
+      exit 1; \
+    fi; \
+    rm -rf /tmp/netty-patch /tmp/parquet-hadoop-bundle-patched.jar
 
 USER 1000:0
