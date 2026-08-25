@@ -1,0 +1,7 @@
+.git
+.tedi/build
+venv
+__pycache__
+*.pyc
+netty-patch
+log4j-patch
