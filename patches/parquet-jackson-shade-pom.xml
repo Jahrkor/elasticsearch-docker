@@ -9,8 +9,8 @@
   <packaging>jar</packaging>
 
   <properties>
-    <jackson.version>2.21.5</jackson.version>
-    <jackson.annotations.version>2.21</jackson.annotations.version>
+    <jackson.version>2.22.3</jackson.version>
+    <jackson.annotations.version>2.22</jackson.annotations.version>
     <maven.shade.plugin.version>3.6.0</maven.shade.plugin.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>

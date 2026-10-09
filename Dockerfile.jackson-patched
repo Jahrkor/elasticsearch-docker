@@ -1,39 +1,47 @@
-ARG BASE_IMAGE=docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.4
-FROM maven:3.9-eclipse-temurin-21 AS parquet-jackson-patch
+ARG BUILDER_IMAGE=maven:3.9-eclipse-temurin-21@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320
+ARG BASE_IMAGE=docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.8-amd64@sha256:8f501c3cee2553e2acc4383554f0ab59e28789a1066f5969eea5118e7966225e
 
-ARG PARQUET_HADOOP_BUNDLE_VERSION=1.17.1
-ARG PARQUET_SHADED_JACKSON_VERSION=2.21.5
-ARG JACKSON_ANNOTATIONS_VERSION=2.21
-ARG JACKSON_VERSION=2.18.9
-ARG NETTY_VERSION=4.1.137.Final
-ARG HTTP_CORE_VERSION=5.4.3
+FROM ${BUILDER_IMAGE} AS dependency-patches
+
+ARG PARQUET_HADOOP_BUNDLE_VERSION=1.18.1
+ARG PARQUET_SHADED_JACKSON_VERSION=2.22.3
+ARG PARQUET_SHADED_JACKSON_ANNOTATIONS_VERSION=2.22
+ARG LZ4_VERSION=1.11.4
+ARG JSOUP_VERSION=1.23.2
 ARG TIKA_VERSION=3.3.2
 ARG MAVEN_BASE_URL=https://repo1.maven.org/maven2
 
 COPY patches/parquet-jackson-shade-pom.xml /tmp/parquet-jackson-patch/pom.xml
 
 RUN set -eu; \
-    workdir="/tmp/parquet-jackson-patch"; \
+    download_verified() { \
+      path="$1"; \
+      expected_sha512="$2"; \
+      output="$3"; \
+      curl -fsSL --retry 3 --retry-delay 2 -o "${output}" "${MAVEN_BASE_URL}/${path}"; \
+      actual_sha512="$(sha512sum "${output}" | awk '{print $1}')"; \
+      if [ "${expected_sha512}" != "${actual_sha512}" ]; then \
+        echo "SHA-512 mismatch for ${path}" >&2; \
+        echo "expected: ${expected_sha512}" >&2; \
+        echo "actual:   ${actual_sha512}" >&2; \
+        exit 1; \
+      fi; \
+    }; \
+    workdir=/tmp/parquet-jackson-patch; \
     cd "${workdir}"; \
-    jar_name="parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar"; \
-    artifact_url="${MAVEN_BASE_URL}/org/apache/parquet/parquet-hadoop-bundle/${PARQUET_HADOOP_BUNDLE_VERSION}/${jar_name}"; \
-    curl -fsSL --retry 3 --retry-delay 2 -o "${jar_name}" "${artifact_url}"; \
-    expected_sha1="$(curl -fsSL "${artifact_url}.sha1" | tr -d '[:space:]')"; \
-    actual_sha1="$(sha1sum "${jar_name}" | awk '{print $1}')"; \
-    if [ "${expected_sha1}" != "${actual_sha1}" ]; then \
-      echo "Checksum mismatch for ${jar_name}" >&2; \
-      echo "expected: ${expected_sha1}" >&2; \
-      echo "actual:   ${actual_sha1}" >&2; \
-      exit 1; \
-    fi; \
+    parquet_jar="parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar"; \
+    download_verified \
+      "org/apache/parquet/parquet-hadoop-bundle/${PARQUET_HADOOP_BUNDLE_VERSION}/${parquet_jar}" \
+      d032eb1e8a30fc527e5cb743d23f87f54a8c2763b810e00505ff3a0dfb2930a902eac6dae272959557b36b6e8b23712383c1cebcdaede04fa7e3706a0c3be234 \
+      "${parquet_jar}"; \
     mvn -q \
       -Djackson.version="${PARQUET_SHADED_JACKSON_VERSION}" \
-      -Djackson.annotations.version="${JACKSON_ANNOTATIONS_VERSION}" \
+      -Djackson.annotations.version="${PARQUET_SHADED_JACKSON_ANNOTATIONS_VERSION}" \
       -DskipTests \
       package; \
     mkdir original relocated out; \
-    (cd original && jar xf "../${jar_name}"); \
-    (cd relocated && jar xf "../target/parquet-jackson-relocator-1.0.0-relocated.jar"); \
+    (cd original && jar xf "../${parquet_jar}"); \
+    (cd relocated && jar xf ../target/parquet-jackson-relocator-1.0.0-relocated.jar); \
     rm -rf original/shaded/parquet/com/fasterxml/jackson; \
     rm -rf original/META-INF/maven/com.fasterxml.jackson.core; \
     cp -R relocated/shaded original/; \
@@ -41,65 +49,24 @@ RUN set -eu; \
       mkdir -p original/META-INF/maven; \
       cp -R relocated/META-INF/maven/com.fasterxml.jackson.core original/META-INF/maven/; \
     fi; \
-    (cd original && jar cfm "../out/${jar_name}" META-INF/MANIFEST.MF .); \
-    jar tf "out/${jar_name}" | grep -q 'shaded/parquet/com/fasterxml/jackson/databind/ObjectMapper.class'; \
-    mkdir -p /tmp/netty-patch; \
-    download_netty() { \
-      artifact="$1"; \
-      expected_sha512="$2"; \
-      netty_jar="${artifact}-${NETTY_VERSION}.jar"; \
-      netty_url="${MAVEN_BASE_URL}/io/netty/${artifact}/${NETTY_VERSION}/${netty_jar}"; \
-      curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/netty-patch/${netty_jar}" "${netty_url}"; \
-      actual_sha512="$(sha512sum "/tmp/netty-patch/${netty_jar}" | awk '{print $1}')"; \
-      if [ "${expected_sha512}" != "${actual_sha512}" ]; then \
-        echo "SHA-512 mismatch for ${netty_jar}" >&2; \
-        echo "expected: ${expected_sha512}" >&2; \
-        echo "actual:   ${actual_sha512}" >&2; \
-        exit 1; \
-      fi; \
-    }; \
-    download_netty netty-buffer d1fbb869280def7d4b27045b490f472e7a01c65b7549bc3585247bef2466e2320afaff7ca87e627a82ca0d2f4ab01b75b7db486b16903e17caaefb79c14c4c2f; \
-    download_netty netty-codec 9a89f308e92f29c39bd0e856a437d84888aa7037ba6d26d2ed94fa2a83559479840dd2310714b63597e041b586bae00198a1dec40e4ebf2cc4f159ec75474708; \
-    download_netty netty-codec-dns 6e739c40c183ecc83b7fb782b85a249140f385000ffcce77c87a4d1b8ee0bee47ab8183179c2a7b0b93cbc657aedaa034984e10e70e60fb362eeb8c7dbe0cd1c; \
-    download_netty netty-codec-http b9909da02987890dc489f1654cd739c57a26952b29c0b503deb715826f9712e0152a5e26fb68b39d348fe94ba34291b97a7ac23b575f0df164fe5d17ced67510; \
-    download_netty netty-codec-http2 efb06f55c64595815888d9b738458c767d2c71cf0730e4e7dfc499c5400cada64a3bb0329a7789303f08071f78242c855f2537ebbc5c6bd84e49343531c005bc; \
-    download_netty netty-codec-socks e7b110354dc9674fb1234eb74f128d692ae89a9140dd96e2c76e91863d79dad48e6347e5965bf1d5c8f5a64b1c9c36ce2f17c587617b07b65f65b427d35a3293; \
-    download_netty netty-common 463594e3ab22dee2889fc3ff25a4c7e1e6bda4498785787021c616c48bdb7f7888acc5bb7b377154e1340d9043205c40d2424c95d881a40d1f0072f15fa73ef8; \
-    download_netty netty-handler 1d0a373325965ca6d2d45af390253894f82474ebeb7cbfddceb16cbfe0bace4d5d0fec6bdd60b8bf2233ee3aace7acbe2beba15260e4667ab525ce1b61762d23; \
-    download_netty netty-handler-proxy efc646bd9509406f084aa621ba19a019cda2d538df979c560f28cfd64068a65e2d5c4dde3dd3495c7cef77099c67bde50a50d72ed4d5ef489d8d4f1d57a169c7; \
-    download_netty netty-resolver 3a6d6dfabcdb88e7675b879547e705e65be8df4ba2ed86fe99fc313137cfd2e02e1c6f7b77f62781b8930fc5d85071d3ca011aa5cd800a9492b085ebfc780bd7; \
-    download_netty netty-resolver-dns 86f49387c887bb5d766ebf91c6c3e51b2bf24599edd15aaf2b4519be5657312cc71cb4510453f91c6602ae83cc3a8a8d4a22c5baee6e300df4e4e52bae6dd66d; \
-    download_netty netty-transport d6fbe968d3666fdc146472755cddb0c785d1e2b256225cede7b362faff534884c03aebfab97d4959d49e0d4605d6e8d86f9d9648d090fa618f02ba5e572b2abc; \
-    download_netty netty-transport-classes-epoll 831d5c8d188fa4dfadf2b6b1f0aef088225134a34a421b44c9ddb72710a91c069c7c254d8a9d111b9fa63869a1fff9d1f82bf222e45cf16b91a2aa7a4013dd28; \
-    download_netty netty-transport-native-unix-common 02d9bf9dee02e50d02a0caf2a9db1e12bee0dc9052a103a48206d9c85738a0648389b2df29d8ed1d65eb854679a6748c515a1c592363ecbcd41cdddc864e537b; \
-    mkdir -p /tmp/httpcore-patch; \
-    for artifact in httpcore5 httpcore5-h2; do \
-      httpcore_jar="${artifact}-${HTTP_CORE_VERSION}.jar"; \
-      httpcore_url="${MAVEN_BASE_URL}/org/apache/httpcomponents/core5/${artifact}/${HTTP_CORE_VERSION}/${httpcore_jar}"; \
-      curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/httpcore-patch/${httpcore_jar}" "${httpcore_url}"; \
-      expected_sha1="$(curl -fsSL "${httpcore_url}.sha1" | tr -d '[:space:]')"; \
-      actual_sha1="$(sha1sum "/tmp/httpcore-patch/${httpcore_jar}" | awk '{print $1}')"; \
-      if [ "${expected_sha1}" != "${actual_sha1}" ]; then \
-        echo "Checksum mismatch for ${httpcore_jar}" >&2; \
-        echo "expected: ${expected_sha1}" >&2; \
-        echo "actual:   ${actual_sha1}" >&2; \
-        exit 1; \
-      fi; \
-    done; \
-    mkdir -p /tmp/tika-patch; \
+    (cd original && jar cfm "../out/${parquet_jar}" META-INF/MANIFEST.MF .); \
+    jar tf "out/${parquet_jar}" | grep -q 'shaded/parquet/com/fasterxml/jackson/databind/ObjectMapper.class'; \
+    mkdir -p /tmp/lz4-patch /tmp/jsoup-patch /tmp/tika-patch; \
+    download_verified \
+      "at/yawk/lz4/lz4-java/${LZ4_VERSION}/lz4-java-${LZ4_VERSION}.jar" \
+      0db8664f43cc4e0f5af07d7adbac7ba5a1137e8cf15379fa749c3b5a483b2f639d609b6e4acecfb6caeac5a5e11bc4a909ef4dae54e82915f3954e74d6d0b62e \
+      "/tmp/lz4-patch/lz4-java-${LZ4_VERSION}.jar"; \
+    download_verified \
+      "org/jsoup/jsoup/${JSOUP_VERSION}/jsoup-${JSOUP_VERSION}.jar" \
+      b9d688df29faac621391d4f1a3391bbd756b74cdc3294ed15ae515eb9ae47eb81a8ec1ae3db4081c07a98129b03d3b24eba1dedce754328d8142c256a7ff0622 \
+      "/tmp/jsoup-patch/jsoup-${JSOUP_VERSION}.jar"; \
     download_tika() { \
       artifact="$1"; \
       expected_sha512="$2"; \
-      tika_jar="${artifact}-${TIKA_VERSION}.jar"; \
-      tika_url="${MAVEN_BASE_URL}/org/apache/tika/${artifact}/${TIKA_VERSION}/${tika_jar}"; \
-      curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/tika-patch/${tika_jar}" "${tika_url}"; \
-      actual_sha512="$(sha512sum "/tmp/tika-patch/${tika_jar}" | awk '{print $1}')"; \
-      if [ "${expected_sha512}" != "${actual_sha512}" ]; then \
-        echo "SHA-512 mismatch for ${tika_jar}" >&2; \
-        echo "expected: ${expected_sha512}" >&2; \
-        echo "actual:   ${actual_sha512}" >&2; \
-        exit 1; \
-      fi; \
+      download_verified \
+        "org/apache/tika/${artifact}/${TIKA_VERSION}/${artifact}-${TIKA_VERSION}.jar" \
+        "${expected_sha512}" \
+        "/tmp/tika-patch/${artifact}-${TIKA_VERSION}.jar"; \
     }; \
     download_tika tika-core cea49d264c1410af6d9208f447e16b6db78c75aec4a11cec74e90dd86847207996656c4223160724626374153603451ab4be177b01eb72236cc7ad0bd25c432b; \
     download_tika tika-langdetect-tika 15316cc73db10551bc0cd3313f3dbb4c9fbbe6524b6599b1aefd29d83f491ef7b373537b66dbfab70da3648251ea8b201d089a1e7d024c8f4e9e556218db429c; \
@@ -111,140 +78,71 @@ RUN set -eu; \
     download_tika tika-parser-text-module 27c88cddd03cfef85d94c0daeba803e9feae44e6d33fc67e2abae90a3b73e46014c5ad7efd868ba3ae1b59fd2acd6d9d38e7e1c5230cb1e315e0fdb6746ef475; \
     download_tika tika-parser-xml-module ee6ed877537a0202e03dd1902c37e1cf18b67828c6ba67baf8a7c3fa1a7415dd4481c6fb373d83c121f007260f14f16991088dd49be49298e1b70588d13c7f2a; \
     download_tika tika-parser-xmp-commons 542a11af2bf87edc3d9f8333679e4b662eca3e39518c1b43351a6aa4bb0b5646128104b82d7291b68c12c5aa75990b95cd0cc5a6ed1b9e72cebd0e842f491413; \
-    download_tika tika-parser-zip-commons 410303c1757d3064e250c27a46d16c190bd8c76acc23d5c3b50e190de254ea053bc1e24b16297ad03cf44a3b6ec4c4e93f7288030e0bbc3832d3184802bbed9f; \
-    mkdir -p /tmp/jackson-patch; \
-    download_jackson() { \
-      group_path="$1"; \
-      artifact="$2"; \
-      expected_sha512="$3"; \
-      jackson_jar="${artifact}-${JACKSON_VERSION}.jar"; \
-      jackson_url="${MAVEN_BASE_URL}/${group_path}/${artifact}/${JACKSON_VERSION}/${jackson_jar}"; \
-      curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/jackson-patch/${jackson_jar}" "${jackson_url}"; \
-      actual_sha512="$(sha512sum "/tmp/jackson-patch/${jackson_jar}" | awk '{print $1}')"; \
-      if [ "${expected_sha512}" != "${actual_sha512}" ]; then \
-        echo "SHA-512 mismatch for ${jackson_jar}" >&2; \
-        echo "expected: ${expected_sha512}" >&2; \
-        echo "actual:   ${actual_sha512}" >&2; \
-        exit 1; \
-      fi; \
-    }; \
-    download_jackson com/fasterxml/jackson/core jackson-annotations 9e277537563103f19df34d2e23a9b42b751787b95d60db20294c24efe3d05ad161ee76811fbaeb3995ed66b46667647d7695da5f393494c954a08527aeefc7e3; \
-    download_jackson com/fasterxml/jackson/core jackson-core 089038fd291cc259f12877bc25b6cba1c786465a3413171e82bc851c396bec7c2b73045fc25b19e814242fbfc8159cccaf7aed766cffe188b5cacbecd57f5865; \
-    download_jackson com/fasterxml/jackson/core jackson-databind 1ce9e558e10ae7e86bd50a43ab9ea90d3ba8e7437e9d2b73eee6c648a4bf7583d532007fd03696c6e01b943e894f0956ebb5344049b011b609273f68eaf6934e; \
-    download_jackson com/fasterxml/jackson/dataformat jackson-dataformat-xml 03fb40dfcff5f13943981656e45c1e3d73cddce57b36922758aac706f451d84eb3bbca09f6401fd8fc0838d062beef12ae373f4a641e6229f36e49860d81e427; \
-    download_jackson com/fasterxml/jackson/datatype jackson-datatype-jsr310 d1e4fadf07c80ba1eb994f7d18566226301564e22fbd1af04d81aba7045c5222011714c0533563f45d0d07489a02551717e3ba8fcf8dd54b249c1aacdfa8d51c; \
-    download_jackson com/fasterxml/jackson/module jackson-module-jaxb-annotations fc15731b472c3241c47eda3c2326bf6c866a4eb07f41f6a9a29b751a5b10be8ec33d3546e9be0fe73092eb0d17d1101f0a1f284142b96765e51f5e15848cb319
+    download_tika tika-parser-zip-commons 410303c1757d3064e250c27a46d16c190bd8c76acc23d5c3b50e190de254ea053bc1e24b16297ad03cf44a3b6ec4c4e93f7288030e0bbc3832d3184802bbed9f
 
 FROM ${BASE_IMAGE}
 
-ARG RELEASE_VERSION
-ARG PARQUET_HADOOP_BUNDLE_VERSION=1.17.1
-ARG OLD_NETTY_VERSION=4.1.135.Final
-ARG NETTY_VERSION=4.1.137.Final
-ARG OLD_HTTP_CORE_VERSION=5.3.5
-ARG HTTP_CORE_VERSION=5.4.3
+ARG RELEASE_VERSION=2.2.2
+ARG SOURCE_REVISION=unknown
+ARG PARQUET_HADOOP_BUNDLE_VERSION=1.18.1
+ARG OLD_LZ4_VERSION=1.11.1
+ARG LZ4_VERSION=1.11.4
+ARG OLD_JSOUP_VERSION=1.21.2
+ARG JSOUP_VERSION=1.23.2
 ARG OLD_TIKA_VERSION=3.2.3
 ARG TIKA_VERSION=3.3.2
-ARG OLD_JACKSON_VERSION=2.18.8
-ARG JACKSON_VERSION=2.18.9
 
-LABEL org.opencontainers.image.title="Elasticrune" \
+LABEL org.opencontainers.image.title="ElasticRune" \
       org.opencontainers.image.version="${RELEASE_VERSION}" \
-      org.opencontainers.image.description="Elasticsearch image with security remediations and Azure snapshot repository support"
+      org.opencontainers.image.description="Hardened Elasticsearch distribution with Azure snapshot repository support" \
+      org.opencontainers.image.source="https://github.com/Jahrkor/elasticsearch-docker" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.licenses="Elastic-License-2.0" \
+      org.opencontainers.image.vendor="hrafnox" \
+      org.opencontainers.image.base.name="docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.8-amd64"
 
 USER 0
 
-COPY --from=parquet-jackson-patch /tmp/parquet-jackson-patch/out/parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar /tmp/parquet-hadoop-bundle-patched.jar
-COPY --from=parquet-jackson-patch /tmp/netty-patch/ /tmp/netty-patch/
-COPY --from=parquet-jackson-patch /tmp/httpcore-patch/ /tmp/httpcore-patch/
-COPY --from=parquet-jackson-patch /tmp/tika-patch/ /tmp/tika-patch/
-COPY --from=parquet-jackson-patch /tmp/jackson-patch/ /tmp/jackson-patch/
+COPY --from=dependency-patches /tmp/parquet-jackson-patch/out/parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar /tmp/parquet-hadoop-bundle-patched.jar
+COPY --from=dependency-patches /tmp/lz4-patch/ /tmp/lz4-patch/
+COPY --from=dependency-patches /tmp/jsoup-patch/ /tmp/jsoup-patch/
+COPY --from=dependency-patches /tmp/tika-patch/ /tmp/tika-patch/
 
 RUN set -eu; \
     apk update; \
-    apk add --no-cache --upgrade \
-      "busybox>=1.38.0-r0" \
-      "libcrypto3>=3.6.3-r5" \
-      "libnghttp2-14>=1.70.0-r0" \
-      "libssl3>=3.6.3-r5"; \
-    packages=""; \
-    for pkg in libcurl-openssl4 openssl; do \
-      if apk info -e "${pkg}" >/dev/null 2>&1; then \
-        packages="${packages} ${pkg}"; \
-      fi; \
-    done; \
-    if [ -n "${packages}" ]; then \
-      apk upgrade --no-cache ${packages}; \
-    fi; \
-    rm -rf /var/cache/apk/*
-
-RUN set -eu; \
+    apk upgrade --no-cache; \
+    rm -rf /var/cache/apk/*; \
     parquet_replaced=0; \
-    for old_jar in $(find /usr/share/elasticsearch/modules -type f -name 'parquet-hadoop-bundle-*.jar' | sort); do \
-      module_dir="${old_jar%/*}"; \
-      rm "${old_jar}"; \
-      cp "/tmp/parquet-hadoop-bundle-patched.jar" "${module_dir}/parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar"; \
-      chown 0:0 "${module_dir}/parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar"; \
-      chmod 0444 "${module_dir}/parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar"; \
+    for old_jar in $(find /usr/share/elasticsearch/modules -type f -name "parquet-hadoop-bundle-${PARQUET_HADOOP_BUNDLE_VERSION}.jar" | sort); do \
+      cp /tmp/parquet-hadoop-bundle-patched.jar "${old_jar}"; \
+      chown 0:0 "${old_jar}"; \
+      chmod 0444 "${old_jar}"; \
       parquet_replaced=$((parquet_replaced + 1)); \
     done; \
-    if [ "${parquet_replaced}" -eq 0 ]; then \
-      echo "No parquet-hadoop-bundle JARs were found to replace" >&2; \
+    if [ "${parquet_replaced}" -ne 2 ]; then \
+      echo "Expected two Parquet bundles, replaced ${parquet_replaced}" >&2; \
       exit 1; \
     fi; \
-    stale="$(find /usr/share/elasticsearch -type f \( -name 'jackson-core-2.15.0.jar' -o -name 'jackson-databind-2.15.0.jar' -o -name 'parquet-hadoop-bundle-1.17.0.jar' \) -print -quit)"; \
-    if [ -n "${stale}" ]; then \
-      echo "Stale vulnerable JAR remains: ${stale}" >&2; \
+    old_lz4="/usr/share/elasticsearch/lib/lz4-java-${OLD_LZ4_VERSION}.jar"; \
+    new_lz4="/usr/share/elasticsearch/lib/lz4-java-${LZ4_VERSION}.jar"; \
+    if [ ! -f "${old_lz4}" ]; then \
+      echo "Missing LZ4 replacement target: ${old_lz4}" >&2; \
       exit 1; \
     fi; \
-    netty_replaced=0; \
-    for old_jar in $(find /usr/share/elasticsearch/modules -type f -name "netty-*-${OLD_NETTY_VERSION}.jar" | sort); do \
-      file_name="${old_jar##*/}"; \
-      artifact="${file_name%-${OLD_NETTY_VERSION}.jar}"; \
-      replacement="/tmp/netty-patch/${artifact}-${NETTY_VERSION}.jar"; \
-      if [ ! -f "${replacement}" ]; then \
-        echo "Missing aligned Netty replacement for ${old_jar}: ${replacement}" >&2; \
-        exit 1; \
-      fi; \
-      module_dir="${old_jar%/*}"; \
-      rm "${old_jar}"; \
-      cp "${replacement}" "${module_dir}/${artifact}-${NETTY_VERSION}.jar"; \
-      chown 0:0 "${module_dir}/${artifact}-${NETTY_VERSION}.jar"; \
-      chmod 0444 "${module_dir}/${artifact}-${NETTY_VERSION}.jar"; \
-      netty_replaced=$((netty_replaced + 1)); \
-    done; \
-    if [ "${netty_replaced}" -eq 0 ]; then \
-      echo "No Netty ${OLD_NETTY_VERSION} JARs were found to replace" >&2; \
+    rm "${old_lz4}"; \
+    cp "/tmp/lz4-patch/lz4-java-${LZ4_VERSION}.jar" "${new_lz4}"; \
+    chown 0:0 "${new_lz4}"; \
+    chmod 0444 "${new_lz4}"; \
+    old_jsoup="/usr/share/elasticsearch/modules/ingest-attachment/jsoup-${OLD_JSOUP_VERSION}.jar"; \
+    new_jsoup="/usr/share/elasticsearch/modules/ingest-attachment/jsoup-${JSOUP_VERSION}.jar"; \
+    if [ ! -f "${old_jsoup}" ]; then \
+      echo "Missing jsoup replacement target: ${old_jsoup}" >&2; \
       exit 1; \
     fi; \
-    stale_netty="$(find /usr/share/elasticsearch/modules -type f -name "netty-*-${OLD_NETTY_VERSION}.jar" -print -quit)"; \
-    if [ -n "${stale_netty}" ]; then \
-      echo "Stale vulnerable Netty JAR remains: ${stale_netty}" >&2; \
-      exit 1; \
-    fi; \
-    httpcore_replaced=0; \
-    for artifact in httpcore5 httpcore5-h2; do \
-      old_jar="/usr/share/elasticsearch/modules/x-pack-core/${artifact}-${OLD_HTTP_CORE_VERSION}.jar"; \
-      replacement="/tmp/httpcore-patch/${artifact}-${HTTP_CORE_VERSION}.jar"; \
-      if [ ! -f "${old_jar}" ] || [ ! -f "${replacement}" ]; then \
-        echo "Missing HttpComponents replacement pair: ${old_jar} -> ${replacement}" >&2; \
-        exit 1; \
-      fi; \
-      rm "${old_jar}"; \
-      cp "${replacement}" "/usr/share/elasticsearch/modules/x-pack-core/${artifact}-${HTTP_CORE_VERSION}.jar"; \
-      chown 0:0 "/usr/share/elasticsearch/modules/x-pack-core/${artifact}-${HTTP_CORE_VERSION}.jar"; \
-      chmod 0444 "/usr/share/elasticsearch/modules/x-pack-core/${artifact}-${HTTP_CORE_VERSION}.jar"; \
-      httpcore_replaced=$((httpcore_replaced + 1)); \
-    done; \
-    if [ "${httpcore_replaced}" -ne 2 ]; then \
-      echo "Expected to replace two HttpComponents Core JARs, replaced ${httpcore_replaced}" >&2; \
-      exit 1; \
-    fi; \
-    stale_httpcore="$(find /usr/share/elasticsearch -type f \( -name "httpcore5-${OLD_HTTP_CORE_VERSION}.jar" -o -name "httpcore5-h2-${OLD_HTTP_CORE_VERSION}.jar" \) -print -quit)"; \
-    if [ -n "${stale_httpcore}" ]; then \
-      echo "Stale vulnerable HttpComponents JAR remains: ${stale_httpcore}" >&2; \
-      exit 1; \
-    fi; \
+    rm "${old_jsoup}"; \
+    cp "/tmp/jsoup-patch/jsoup-${JSOUP_VERSION}.jar" "${new_jsoup}"; \
+    chown 0:0 "${new_jsoup}"; \
+    chmod 0444 "${new_jsoup}"; \
     tika_replaced=0; \
     for replacement in /tmp/tika-patch/tika-*-${TIKA_VERSION}.jar; do \
       file_name="${replacement##*/}"; \
@@ -261,51 +159,20 @@ RUN set -eu; \
       tika_replaced=$((tika_replaced + 1)); \
     done; \
     if [ "${tika_replaced}" -ne 11 ]; then \
-      echo "Expected to replace 11 aligned Tika JARs, replaced ${tika_replaced}" >&2; \
+      echo "Expected 11 aligned Tika JARs, replaced ${tika_replaced}" >&2; \
       exit 1; \
     fi; \
-    stale_tika="$(find /usr/share/elasticsearch/modules/ingest-attachment -type f -name "tika-*-${OLD_TIKA_VERSION}.jar" -print -quit)"; \
-    if [ -n "${stale_tika}" ]; then \
-      echo "Stale vulnerable Tika JAR remains: ${stale_tika}" >&2; \
+    stale="$(find /usr/share/elasticsearch -type f \( \
+      -name "lz4-java-${OLD_LZ4_VERSION}.jar" -o \
+      -name "jsoup-${OLD_JSOUP_VERSION}.jar" -o \
+      -name "tika-*-${OLD_TIKA_VERSION}.jar" \
+    \) -print -quit)"; \
+    if [ -n "${stale}" ]; then \
+      echo "Stale vulnerable JAR remains: ${stale}" >&2; \
       exit 1; \
     fi; \
-    jackson_replaced=0; \
-    replace_jackson() { \
-      module="$1"; \
-      artifact="$2"; \
-      old_jar="/usr/share/elasticsearch/modules/${module}/${artifact}-${OLD_JACKSON_VERSION}.jar"; \
-      replacement="/tmp/jackson-patch/${artifact}-${JACKSON_VERSION}.jar"; \
-      if [ ! -f "${old_jar}" ] || [ ! -f "${replacement}" ]; then \
-        echo "Missing exact Jackson replacement pair: ${old_jar} -> ${replacement}" >&2; \
-        exit 1; \
-      fi; \
-      rm "${old_jar}"; \
-      cp "${replacement}" "/usr/share/elasticsearch/modules/${module}/${artifact}-${JACKSON_VERSION}.jar"; \
-      chown 0:0 "/usr/share/elasticsearch/modules/${module}/${artifact}-${JACKSON_VERSION}.jar"; \
-      chmod 0444 "/usr/share/elasticsearch/modules/${module}/${artifact}-${JACKSON_VERSION}.jar"; \
-      jackson_replaced=$((jackson_replaced + 1)); \
-    }; \
-    for module in ingest-geoip x-pack-ent-search x-pack-esql; do \
-      for artifact in jackson-annotations jackson-core jackson-databind; do \
-        replace_jackson "${module}" "${artifact}"; \
-      done; \
-    done; \
-    for module in repository-azure x-pack-inference; do \
-      for artifact in jackson-annotations jackson-core jackson-databind jackson-dataformat-xml jackson-datatype-jsr310 jackson-module-jaxb-annotations; do \
-        replace_jackson "${module}" "${artifact}"; \
-      done; \
-    done; \
-    if [ "${jackson_replaced}" -ne 21 ]; then \
-      echo "Expected to replace 21 module-aligned Jackson JARs, replaced ${jackson_replaced}" >&2; \
-      exit 1; \
-    fi; \
-    for module in ingest-geoip repository-azure x-pack-ent-search x-pack-esql x-pack-inference; do \
-      stale_jackson="$(find "/usr/share/elasticsearch/modules/${module}" -type f -name "jackson-*-${OLD_JACKSON_VERSION}.jar" -print -quit)"; \
-      if [ -n "${stale_jackson}" ]; then \
-        echo "Stale vulnerable Jackson JAR remains: ${stale_jackson}" >&2; \
-        exit 1; \
-      fi; \
-    done; \
-    rm -rf /tmp/httpcore-patch /tmp/jackson-patch /tmp/netty-patch /tmp/tika-patch /tmp/parquet-hadoop-bundle-patched.jar
+    test -f "${new_lz4}"; \
+    test -f "${new_jsoup}"; \
+    rm -rf /tmp/lz4-patch /tmp/jsoup-patch /tmp/tika-patch /tmp/parquet-hadoop-bundle-patched.jar
 
 USER 1000:0

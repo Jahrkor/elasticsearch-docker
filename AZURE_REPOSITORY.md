@@ -1,8 +1,8 @@
 Azure snapshot repositories
 ============================
 
-Elasticrune `2.2.1` exposes the `repository-azure` module bundled with
-Elasticsearch `9.4.4`. It is located at:
+ElasticRune `2.2.2` exposes the `repository-azure` module bundled with
+Elasticsearch `9.4.8`. It is located at:
 
 ```text
 /usr/share/elasticsearch/modules/repository-azure
@@ -10,7 +10,7 @@ Elasticsearch `9.4.4`. It is located at:
 
 Do not install `repository-azure` again and do not add it to
 `elasticsearch-plugins.yml`. The module is part of the Elasticsearch
-distribution and its descriptor is version-matched to Elasticsearch `9.4.4`.
+distribution and its descriptor is version-matched to Elasticsearch `9.4.8`.
 
 Credential handling
 -------------------

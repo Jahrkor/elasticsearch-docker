@@ -1,22 +1,14 @@
 # Backward-compatible Dockerfile name for older pipelines.
 # The active hardening path is Dockerfile.jackson-patched. This legacy entry
 # point remains version-aligned for older pipelines that reference its name.
-ARG BASE_IMAGE=docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.4
+ARG BASE_IMAGE=docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.8-amd64@sha256:8f501c3cee2553e2acc4383554f0ab59e28789a1066f5969eea5118e7966225e
 FROM ${BASE_IMAGE}
 
 USER 0
 
 RUN set -eu; \
     apk update; \
-    packages=""; \
-    for pkg in busybox libcrypto3 libssl3 libcurl-openssl4 openssl; do \
-      if apk info -e "${pkg}" >/dev/null 2>&1; then \
-        packages="${packages} ${pkg}"; \
-      fi; \
-    done; \
-    if [ -n "${packages}" ]; then \
-      apk upgrade --no-cache ${packages}; \
-    fi; \
+    apk upgrade --no-cache; \
     rm -rf /var/cache/apk/*
 
 USER 1000:0

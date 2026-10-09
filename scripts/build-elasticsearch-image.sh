@@ -11,6 +11,7 @@ DOCKERFILE="${DOCKERFILE:-Dockerfile.jackson-patched}"
 CONTEXT="${CONTEXT:-.}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 NO_CACHE="${NO_CACHE:-true}"
+SOURCE_REVISION="${SOURCE_REVISION:-$(git rev-parse HEAD 2>/dev/null || printf unknown)}"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required to build the image" >&2
@@ -26,10 +27,12 @@ fi
 if [ -n "${PLATFORM}" ]; then
   docker build ${no_cache_arg} --pull --platform "${PLATFORM}" \
     --build-arg "RELEASE_VERSION=${IMAGE_VERSION}" \
+    --build-arg "SOURCE_REVISION=${SOURCE_REVISION}" \
     -f "${DOCKERFILE}" -t "${IMAGE_REF}" "${CONTEXT}"
 else
   docker build ${no_cache_arg} --pull \
     --build-arg "RELEASE_VERSION=${IMAGE_VERSION}" \
+    --build-arg "SOURCE_REVISION=${SOURCE_REVISION}" \
     -f "${DOCKERFILE}" -t "${IMAGE_REF}" "${CONTEXT}"
 fi
 

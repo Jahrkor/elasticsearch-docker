@@ -1,146 +1,133 @@
-Elasticsearch Docker image hardening
-====================================
+# ElasticRune
 
-This repository builds a hardened Elasticsearch image from the official
-Elastic Wolfi image.
+ElasticRune is an independently versioned, security-maintained Elasticsearch
+container distribution built from Elastic's official Wolfi image. It is a
+community project maintained by `hrafnox`; it is not an official Elastic
+product and is not endorsed by Elastic.
 
-Current release
----------------
+## Current release
 
-- Release tag: `hrafnox/elasticrune:2.2.1`
-- Build Dockerfile: `Dockerfile.jackson-patched`
-- Base image: `docker.elastic.co/elasticsearch/elasticsearch-wolfi:9.4.4`
-- Elasticsearch: `9.4.4`
-- Platform: `linux/amd64`
-- Runtime user: `1000:0`
-- Entrypoint and exposed ports: inherited from the official image
-- Azure snapshot repositories: bundled `repository-azure` module
+| Component | Version |
+| --- | --- |
+| ElasticRune | `2.2.2` |
+| Image | `hrafnox/elasticrune:2.2.2` |
+| Elasticsearch | `9.4.8` |
+| Bundled OpenJDK | `27` |
+| Platform | `linux/amd64` |
+| Runtime user | `1000:0` (`elasticsearch`) |
+| Base | Official Elasticsearch Wolfi `9.4.8-amd64` image, digest-pinned |
 
-The release security gate is zero Critical and zero High vulnerabilities,
-without Trivy ignores, severity changes, grace periods, or unfixed-finding
-suppression.
+ElasticRune tags are distribution releases, not Elasticsearch engine
+versions. A patch release may adopt a compatible Elasticsearch patch release,
+but it does not silently change the Elasticsearch major or minor contract.
+Only `linux/amd64` is validated. Older ElasticRune tags are retained as
+immutable historical releases; they do not receive fixes in place.
 
-Vulnerability remediation
--------------------------
+The image inherits the official entrypoint, command, ports, configuration,
+data paths, security defaults, and bundled modules. Elasticsearch 9.4.8
+provides the `repository-azure` module; no separate plugin is installed.
 
-Elasticsearch `9.4.4` supplies fixed direct Jackson `2.18.8` artifacts. Two
-Parquet bundles still contained vulnerable shaded Jackson classes, the
-distribution still supplied Netty `4.1.135.Final`, and its x-pack-core module
-contained HttpComponents Core `5.3.5`. The bundled ingest-attachment module
-also contained the aligned Apache Tika `3.2.3` family affected by
-`CVE-2026-66755`.
+## Security maintenance
 
-`Dockerfile.jackson-patched` therefore makes five narrowly scoped distribution
-patches:
+The release gate is zero Critical and zero High findings in the merged runtime
+filesystem, with no ignored vulnerabilities, severity overrides, grace
+periods, or unfixed-finding suppression. Downloads used by the custom patch
+stage have pinned SHA-512 digests. The base and builder images are pinned by
+digest, and the build fails if expected replacement targets or counts change.
 
-- replaces both `parquet-hadoop-bundle-1.17.0.jar` copies with a repacked
-  `1.17.1` bundle whose shaded Jackson components are `2.21.5`;
-- replaces every Netty `4.1.135.Final` module with the corresponding
-  `4.1.137.Final` artifact as one aligned set;
-- replaces `httpcore5` and `httpcore5-h2` `5.3.5` with `5.4.3`;
-- replaces all 11 Tika `3.2.3` artifacts in `ingest-attachment` with their
-  aligned `3.3.2` counterparts;
-- updates the five module-local Jackson families that include Databind from
-  `2.18.8` to `2.18.9`, and rebuilds the shaded Parquet copies with Jackson
-  `2.21.5`.
+Release 2.2.2 moves the engine from 9.4.4 to the compatible 9.4.8 patch release,
+upgrades installed Wolfi packages, and applies these targeted repairs:
 
-The build also overrides the base image's exact package pins with fixed minimum
-versions for BusyBox `1.38.0-r0`, OpenSSL `3.6.3-r5`, and libnghttp2
-`1.70.0-r0`.
+- Bouncy Castle `1.84` to `1.85` through the official Elasticsearch base;
+- LZ4 Java `1.11.1` to `1.11.4`;
+- jsoup `1.21.2` to `1.23.2`;
+- both Parquet `1.18.1` bundles rebuilt with shaded Jackson `2.22.3`;
+- the aligned 11-artifact Apache Tika family from `3.2.3` to `3.3.2`.
 
-Downloaded artifacts are checked before installation. The Tika, direct
-Jackson, and Netty artifacts use pinned SHA-512 digests; the existing Parquet and
-HttpComponents repairs use Maven Central checksum sidecars. The image build
-fails if an expected replacement is missing, if no matching distribution JAR
-is found, or if a stale vulnerable-version JAR remains.
+Trivy reports 27 Medium rows representing seven unique CVEs:
 
-Build
------
+- `CVE-2025-48924`, Commons Lang `3.9`: upstream module dependency; replacing
+  it alone would bypass Elasticsearch integration and compatibility testing.
+- `CVE-2026-49844`, Log4j API `2.25.4`: embedded in the Elastic APM agent and
+  not safely replaceable as a standalone JAR.
+- `CVE-2026-77420`, JLine Reader `3.21.0`: upstream CLI dependency; the risk is
+  limited to local history configuration processing.
+- `CVE-2026-8674`, `CVE-2026-86805`, `CVE-2026-89092`, and
+  `CVE-2026-95818`, glibc `2.44-r7`: the scanner advertises `r8`, but `r8` is
+  not available from the digest-pinned image's configured Wolfi snapshot after
+  a full package upgrade. These primarily require local execution or unusual
+  resolver/loader inputs; retain non-root execution and constrained container
+  privileges until a compatible base publishes the fixed packages.
 
-The default build is a fresh `linux/amd64` build of the release tag and pulls
-the current base-image manifest:
+Docker Scout's image-history analysis can report the superseded JARs from the
+immutable lower base layer. A Scout scan of the exported merged filesystem and
+a Trivy runtime-filesystem scan both report zero Critical and zero High; the
+old JARs are absent from the runnable filesystem. This distinction must be
+revalidated for every release and is not a suppression.
+
+## Build and scan
+
+Build the default release for `linux/amd64`:
 
 ```sh
 ./scripts/build-elasticsearch-image.sh
 ```
 
-Set `NO_CACHE=false` only for local development. The image name, tag,
-Dockerfile, context, and platform remain overrideable through `IMAGE_NAME`,
-`TAG`, `DOCKERFILE`, `CONTEXT`, and `PLATFORM`.
+Set `NO_CACHE=false` only for local development. `IMAGE_REPOSITORY`,
+`IMAGE_VERSION`, `DOCKERFILE`, `CONTEXT`, and `PLATFORM` are overrideable.
 
-Scan
-----
-
-Trivy is required. The script scans Critical and High findings, includes
-unfixed findings, and exits nonzero if any finding is detected:
+Run the Critical/High release gate:
 
 ```sh
 ./scripts/scan-elasticsearch-image.sh
 ```
 
-Expected result for the release image: `0 CRITICAL`, `0 HIGH`.
+The scanner includes fixed and unfixed findings and exits nonzero for any
+Critical or High result.
 
-Known Medium findings
----------------------
+## Run
 
-The release retains 11 Trivy Medium rows where an isolated JAR replacement is
-not justified without upstream integration coverage:
-
-- `CVE-2025-22227`: Reactor Netty HTTP `1.0.45` (three module copies); the
-  available fix crosses to the `1.2.x` family and must remain aligned with
-  Reactor Core.
-- `CVE-2025-48924`: Commons Lang `3.9`; the fixed `3.18.0` is a large jump in
-  the `x-pack-ent-search` module.
-- `CVE-2026-45292`: OpenTelemetry API `1.47.0` (two module copies); the fixed
-  `1.62.0` requires a coordinated OpenTelemetry family update.
-- `CVE-2026-49844`: Log4j API `2.26.0` and an embedded `2.25.4` copy in the APM
-  agent; one is core logging infrastructure and the other cannot be safely
-  replaced independently inside the agent bundle.
-- `CVE-2026-59949`: LZ4 Java `1.10.1`; the fixed `1.11.1` affects core
-  compression and persistence paths.
-- `CVE-2026-64607`: HttpClient 5 `5.5`; the fixed `5.6.3` is a larger minor
-  update in `x-pack-core` than the separately aligned HttpCore repair.
-- `CVE-2026-71497`: jsoup `1.21.2`; the scanner-fixed `1.23.1` is ahead of the
-  version integrated by upstream Elasticsearch and is on the attachment parser
-  path.
-
-Smoke test
-----------
+Elasticsearch security remains enabled. Supply a strong bootstrap password and
+mount a named volume for data:
 
 ```sh
-docker run --rm --name elasticrune-smoke \
+docker run --name elasticrune \
   -p 9200:9200 \
   -e 'discovery.type=single-node' \
-  -e 'xpack.security.enabled=false' \
-  -e 'ES_JAVA_OPTS=-Xms512m -Xmx512m' \
-  hrafnox/elasticrune:2.2.1
+  -e 'ELASTIC_PASSWORD=replace-with-a-secret' \
+  -e 'ES_JAVA_OPTS=-Xms1g -Xmx1g' \
+  -v elasticrune-data:/usr/share/elasticsearch/data \
+  hrafnox/elasticrune:2.2.2
 ```
 
-Verify the root endpoint, cluster health, and installed plugins:
+Copy `/usr/share/elasticsearch/config/certs/http_ca.crt` from the container and
+use it to validate HTTPS. Do not disable TLS or authentication merely for
+deployment convenience. Keep credentials out of Dockerfiles, labels, image
+environment defaults, and source control.
 
-```sh
-curl http://localhost:9200/
-curl http://localhost:9200/_cluster/health
-curl 'http://localhost:9200/_cat/plugins?format=json'
-```
+## Compatibility and limitations
 
-Compatibility note
-------------------
+The 2.2.2 validation covers startup, HTTPS/authentication, green cluster
+health, index/document CRUD, persistence across restart, attachment ingestion,
+non-root permissions, bundled module discovery, and graceful shutdown. The
+entrypoint, command, ports, paths, architecture, and Elasticsearch 9.4
+major/minor contract are unchanged from 2.2.1. The official base now bundles
+OpenJDK 27 instead of 26, and internal libraries and OS packages have moved to
+their 9.4.8-compatible versions.
 
-Netty, HttpComponents Core, Apache Tika, and the shaded Parquet/Jackson
-implementation are internal Elasticsearch distribution dependencies. Startup,
-green cluster health, attachment parsing, module enumeration,
-and index/document CRUD are validated for this release. Workloads using Azure,
-gRPC, inference, or ESQL external data sources should retain targeted
-integration coverage because those modules consume these replaced
-dependencies.
+Azure repository connectivity, multi-node rolling upgrades, ESQL external data
+sources, inference, custom plugins, and workload-specific performance are not
+covered by the local release smoke test. Exercise targeted integration tests
+before production adoption. See [AZURE_REPOSITORY.md](AZURE_REPOSITORY.md) for
+secure Azure snapshot configuration.
 
-Azure snapshot repositories
----------------------------
+Do not use `latest` as a release selector. Pin `2.2.2` or, preferably, the
+published registry digest.
 
-Elasticsearch `9.4.4` bundles the version-matched `repository-azure` module,
-so this image does not install a duplicate plugin or add Azure SDK JARs. See
-`AZURE_REPOSITORY.md` for secure deployment-time credential configuration,
-repository registration, verification, snapshot, and identity examples.
+## Licensing
 
-Do not push `latest` or any rolling tag for this release.
+Repository source remains under the included Apache License 2.0. The image
+contains Elasticsearch binaries governed by Elastic License 2.0 and
+third-party components under their respective licenses. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). No upstream copyright or
+license notices are removed.
